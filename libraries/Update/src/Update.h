@@ -160,7 +160,7 @@ class UpdateClass {
   private:
     void _reset();
     void _abort(uint8_t err);
-    bool _writeBuffer();
+    bool _writeBuffer(bool final=false);
     bool _verifyHeader(uint8_t data);
     bool _verifyEnd();
 
@@ -179,6 +179,9 @@ class UpdateClass {
 
     int _ledPin;
     uint8_t _ledOn;
+
+    int partialBytes;
+    uint8_t partialData[16];
 };
 
 extern UpdateClass Update;

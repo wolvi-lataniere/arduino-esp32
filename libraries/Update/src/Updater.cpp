@@ -4,6 +4,8 @@
 #include "esp_ota_ops.h"
 #include "esp_image_format.h"
 
+#define MIN(A,B) ((A<B)?A:B)
+
 static const char * _err2str(uint8_t _error){
     if(_error == UPDATE_ERROR_OK){
         return ("No Error");
@@ -35,12 +37,42 @@ static const char * _err2str(uint8_t _error){
     return ("UNKNOWN");
 }
 
+/**
+ * @brief Read data from encrypted partition using Memory Mapper
+ * 
+ * esp_partition_read is not usable for encrypted partitions
+ * 
+ * @param partition Partition to read data from
+ * @param offset Offset of the data to read in the partition
+ * @param buffer Buffer to store read data (should be at least `len` bytes long)
+ * @param len Amount of data to read from the partition
+ */
+static bool _readPartitionData(const esp_partition_t* partition, size_t offset, uint8_t *buffer, size_t len)
+{
+    if (!partition || (!buffer) || (partition->size<(offset+len)))
+        return false;
+
+    spi_flash_mmap_handle_t ota_data_mmap;
+    const void* result = NULL;
+    esp_err_t err = esp_partition_mmap(partition, 0, partition->size, SPI_FLASH_MMAP_DATA, &result, &ota_data_mmap);
+
+    if (err != ESP_OK)
+    {
+        return false;
+    } else {
+        memcpy(buffer, (uint8_t*)result+offset, len);
+        spi_flash_munmap(ota_data_mmap);
+    }
+    return true;
+}
+
 static bool _partitionIsBootable(const esp_partition_t* partition){
-    uint8_t buf[4];
+    uint8_t buf[8];
+    memset(buf, 0, 4);
     if(!partition){
         return false;
     }
-    if(!ESP.flashRead(partition->address, (uint32_t*)buf, 4)) {
+    if(!_readPartitionData(partition, 0, buf, 8)){
         return false;
     }
 
@@ -51,16 +83,32 @@ static bool _partitionIsBootable(const esp_partition_t* partition){
 }
 
 static bool _enablePartition(const esp_partition_t* partition){
-    uint8_t buf[4];
+    uint8_t *buf;
     if(!partition){
         return false;
     }
-    if(!ESP.flashRead(partition->address, (uint32_t*)buf, 4)) {
+
+    buf = (uint8_t*)malloc(SPI_FLASH_SEC_SIZE);
+
+    if(buf == NULL)
+        return false;
+
+    if(!_readPartitionData(partition, 0, buf, SPI_FLASH_SEC_SIZE)){
+        free(buf);
         return false;
     }
+
     buf[0] = ESP_IMAGE_HEADER_MAGIC;
 
-    return ESP.flashWrite(partition->address, (uint32_t*)buf, 4);
+    esp_partition_erase_range(partition, 0, SPI_FLASH_SEC_SIZE);
+    if (esp_partition_write(partition, 0, buf, SPI_FLASH_SEC_SIZE) != ESP_OK)
+    {
+        free(buf);
+        return false;
+    }
+
+    free(buf);
+    return true;
 }
 
 UpdateClass::UpdateClass()
@@ -72,6 +120,8 @@ UpdateClass::UpdateClass()
 , _progress(0)
 , _command(U_FLASH)
 , _partition(NULL)
+, partialBytes(0)
+, partialData()
 {
 }
 
@@ -165,6 +215,12 @@ bool UpdateClass::begin(size_t size, int command, int ledPin, uint8_t ledOn) {
     _size = size;
     _command = command;
     _md5.begin();
+
+    // Erase the partition before starting firmware update
+    if (esp_partition_erase_range(_partition, 0, (_size / SPI_FLASH_SEC_SIZE + 1) * SPI_FLASH_SEC_SIZE) != ESP_OK) {
+        _abort(UPDATE_ERROR_ERASE);
+        return false;
+    }
     return true;
 }
 
@@ -177,7 +233,16 @@ void UpdateClass::abort(){
     _abort(UPDATE_ERROR_ABORT);
 }
 
-bool UpdateClass::_writeBuffer(){
+/**
+ * @brief Write buffer content to the end of the partition
+ * 
+ * This function has been rewritten according to esp_ota_write procedure to handle
+ * multiple of 16 bytes block write, and seemless data encryption using esp_partition_write function.
+ * 
+ * @param final Indicate the end of transfert, forces the write of remaining data to the end of flash
+ **/
+bool UpdateClass::_writeBuffer(bool final){
+    int copyLen = 0;
     //first bytes of new firmware
     if(!_progress && _command == U_FLASH){
         //check magic
@@ -189,24 +254,74 @@ bool UpdateClass::_writeBuffer(){
         //this ensures that partially written firmware will not be bootable
         _buffer[0] = 0xFF;
     }
+
     if (!_progress && _progress_callback) {
         _progress_callback(0, _size);
     }
-    if(!ESP.flashEraseSector((_partition->address + _progress)/SPI_FLASH_SEC_SIZE)){
-        _abort(UPDATE_ERROR_ERASE);
-        return false;
+    
+    // Check if there are still data to write from last write
+    if (this->partialBytes > 0)
+    {
+        // Complete buffer with data from the beginning of current buffer
+        copyLen = MIN(16 - this->partialBytes, _bufferLen);
+        memcpy(this->partialData + this->partialBytes, _buffer, copyLen);
+        this->partialBytes += copyLen;
+
+        // If enouth data to write one block
+        if (this->partialBytes == 16)
+        {
+            // Write the block
+            if (esp_partition_write(_partition, _progress, this->partialData, 16) != ESP_OK ) {
+                _abort(UPDATE_ERROR_WRITE);
+                return false;
+            }
+
+            // Clear the buffer
+            this->partialBytes = 0;
+            _md5.add(this->partialData, 16);
+            memset(this->partialData, 0xFF, 16);
+            // And update the datalength
+            _progress += 16;
+            _bufferLen -= copyLen;
+        }            
     }
-    if (!ESP.flashWrite(_partition->address + _progress, (uint32_t*)_buffer, _bufferLen)) {
+
+    // check if more data to store
+    this->partialBytes = _bufferLen % 16;
+    if (this->partialBytes != 0)
+    {
+        _bufferLen -= this->partialBytes;
+        memcpy(this->partialData, _buffer + copyLen + _bufferLen, this->partialBytes);
+    }
+
+    // Write completes blocks from data
+    if (esp_partition_write(_partition, _progress, _buffer + copyLen, _bufferLen) != ESP_OK ) {
         _abort(UPDATE_ERROR_WRITE);
         return false;
     }
+
     //restore magic or md5 will fail
     if(!_progress && _command == U_FLASH){
         _buffer[0] = ESP_IMAGE_HEADER_MAGIC;
     }
-    _md5.add(_buffer, _bufferLen);
+    
+    // Compute the MD5 sum
+    _md5.add(_buffer + copyLen, _bufferLen);
     _progress += _bufferLen;
     _bufferLen = 0;
+
+    // Forces final block write if data remaining in buffer
+    if (final && (partialBytes>0))
+    {
+        log_d("Writting final %d bytes", partialBytes);
+        if (esp_partition_write(_partition, _progress, this->partialData, 16) != ESP_OK ) {
+            _abort(UPDATE_ERROR_WRITE);
+            return false;
+        }
+        _md5.add(this->partialData, this->partialBytes);
+        _progress += this->partialBytes;
+    }
+
     if (_progress_callback) {
         _progress_callback(_progress, _size);
     }
@@ -268,7 +383,7 @@ bool UpdateClass::end(bool evenIfRemaining){
 
     if(evenIfRemaining) {
         if(_bufferLen > 0) {
-            _writeBuffer();
+            _writeBuffer(true);
         }
         _size = progress();
     }
@@ -308,7 +423,7 @@ size_t UpdateClass::write(uint8_t *data, size_t len) {
     memcpy(_buffer + _bufferLen, data + (len - left), left);
     _bufferLen += left;
     if(_bufferLen == remaining()){
-        if(!_writeBuffer()){
+        if(!_writeBuffer(true)){
             return len - left;
         }
     }
